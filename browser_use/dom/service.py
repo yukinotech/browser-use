@@ -440,6 +440,15 @@ class DomService:
 
 		Returns:
 			Tuple of (enhanced_dom_tree_node, timing_info)
+
+		中文总结：
+			- 入参 target_id/all_frames/initial_html_frames/initial_total_frame_offset/iframe_depth 分别指定目标页面、可重用的 frame 层级缓存、当前 iframe 链、累积的坐标偏移与递归深度控制，确保递归构建过程中既能精准定位节点又能防止无限展开。
+			- 函数首先记录时间并通过 `_get_all_trees` 并发获取 DOM/AX/Snapshot 信息，然后建立 AX 查找表 `ax_tree_lookup`、节点缓存 `enhanced_dom_tree_node_lookup` 以及页面截图解析结果 `snapshot_lookup`，为后续重建树做准备。
+			- 内部异步函数 `_construct_enhanced_node` 逐节点执行：复制输入的 frame offset、复用或创建 EnhancedDOMTreeNode、挂载 AX/属性/ShadowRoot/Snapshot 元数据，同时根据 snapshot 坐标和 iframe/scroll 信息更新可见性与绝对坐标。
+			- 当节点为 iframe 时会追加 HTML frame 轨迹并根据 cross_origin_iframes 配置、尺寸与可见性，惰性获取所有 frame，再递归调用 `get_dom_tree` 以填充跨域 frame 的子树，递归深度由 `iframe_depth` 控制。
+			- 对于普通子节点及 shadow roots，函数都会递归构建 EnhancedDOMTreeNode 并设置父子关系。所有叶子节点的 `is_visible` 会依据 HTML frame 栈由 `is_element_visible_according_to_all_parents` 计算。
+			- EnhancedDOMTreeNode 是一个聚合 DOM/AX/Snapshot/Frame 信息的数据结构，包含原始节点类型、文本与属性、可见性、绝对位置、会话/Frame ID、父子/Shadow 关系、嵌入的 AX 与截图节点等，便于后续序列化和交互选择。
+			- 主函数最后记录构建耗时、统计子操作耗时并返回 (根 EnhancedDOMTreeNode, timing_info) 以便上层既能使用 DOM 数据又能分析性能瓶颈。
 		"""
 		timing_info: dict[str, float] = {}
 		timing_start_total = time.time()
