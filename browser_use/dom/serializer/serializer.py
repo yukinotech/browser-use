@@ -65,6 +65,14 @@ class DOMTreeSerializer:
 		paint_order_filtering: bool = True,
 		session_id: str | None = None,
 	):
+		"""
+		初始化一次序列化任务需要的缓存和开关。
+
+		这里保存 DOM 根节点、上一帧 selector_map（用于标记“新”节点）、可点击检测缓存、
+		包围盒/涂层过滤配置以及 session 专属的 `data-browser-use-exclude-{session}` 属性
+		名称。LLM 执行动作时依赖 `_selector_map` 中的 backend_node_id 映射，因此所有状态
+		都在此处准备好。
+		"""
 		self.root_node = root_node
 		self._interactive_counter = 1
 		self._selector_map: DOMSelectorMap = {}
@@ -82,14 +90,24 @@ class DOMTreeSerializer:
 		self.session_id = session_id
 
 	def _safe_parse_number(self, value_str: str, default: float) -> float:
-		"""Parse string to float, handling negatives and decimals."""
+		"""
+		把 DOM / AX 属性里的字符串安全地转成浮点数，失败就回退到默认值。
+
+		很多复合控件（slider、range 等）通过字符串暴露 min/max/value，这里集中处理
+		所有非法输入，避免在序列化过程中抛出异常。
+		"""
 		try:
 			return float(value_str)
 		except (ValueError, TypeError):
 			return default
 
 	def _safe_parse_optional_number(self, value_str: str | None) -> float | None:
-		"""Parse string to float, returning None for invalid values."""
+		"""
+		解析可选数值；遇到非法输入时直接返回 None。
+
+		与 `_safe_parse_number` 不同的是，这里让调用方知道“这个范围值不存在”，进而
+		在序列化时省略对应的 compound component 属性。
+		"""
 		if not value_str:
 			return None
 		try:
@@ -98,6 +116,16 @@ class DOMTreeSerializer:
 			return None
 
 	def serialize_accessible_elements(self) -> tuple[SerializedDOMState, dict[str, float]]:
+		"""
+		序列化入口：构建简化树并打上 LLM 需要的所有标记。
+
+		流程：1) `_create_simplified_tree` 仅复制可见或重要节点（含 Shadow DOM）。
+		      2) `PaintOrderRemover` 根据绘制顺序标记被遮挡元素。
+		      3) `_optimize_tree` 删除无语义的包装节点。
+		      4) `_apply_bounding_box_filtering` 折叠完全被父级覆盖的重复结构。
+		      5) `_assign_interactive_indices_and_mark_new_nodes` 给可交互节点编号并标记新增。
+		最后返回 `SerializedDOMState`（树 + selector_map）以及各阶段耗时。
+		"""
 		import time
 
 		start_total = time.time()
@@ -148,7 +176,12 @@ class DOMTreeSerializer:
 		return SerializedDOMState(_root=filtered_tree, selector_map=self._selector_map), self.timing_info
 
 	def _add_compound_components(self, simplified: SimplifiedNode, node: EnhancedDOMTreeNode) -> None:
-		"""Enhance compound controls with information from their child components."""
+		"""
+		为复合控件补齐“虚拟子组件”说明，使 LLM 理解控件包含哪些按钮/滑块/列表。
+
+		这里针对 input/select/details/audio/video 等元素读取 AX 属性、推断子控件，
+		并写入 `node._compound_children`，后续序列化时会输出 `compound_components=...`。
+		"""
 		# Only process elements that might have compound components
 		if node.tag_name not in ['input', 'select', 'details', 'audio', 'video']:
 			return
@@ -333,7 +366,12 @@ class DOMTreeSerializer:
 			simplified.is_compound_component = True
 
 	def _extract_select_options(self, select_node: EnhancedDOMTreeNode) -> dict[str, Any] | None:
-		"""Extract option information from a select element."""
+		"""
+		为 <select> 收集 option 列表及格式提示。
+
+		它递归遍历 option/optgroup，只保留前四个展示文本，并尝试根据 value 模式
+		推断“数字 / 州缩写 / 日期”之类的 format_hint，用于 compound_components 输出。
+		"""
 		if not select_node.children:
 			return None
 
@@ -415,7 +453,12 @@ class DOMTreeSerializer:
 		return {'count': len(options), 'first_options': first_options, 'format_hint': format_hint}
 
 	def _is_interactive_cached(self, node: EnhancedDOMTreeNode) -> bool:
-		"""Cached version of clickable element detection to avoid redundant calls."""
+		"""
+		封装 ClickableElementDetector，并记住结果与耗时。
+
+		同一个节点可能在多个阶段被检查（收集 / 赋值 / 过滤），缓存可避免重复
+		模型推理，同时将耗时累计到 `timing_info['clickable_detection_time']`。
+		"""
 
 		if node.node_id not in self._clickable_cache:
 			import time
@@ -433,7 +476,15 @@ class DOMTreeSerializer:
 		return self._clickable_cache[node.node_id]
 
 	def _create_simplified_tree(self, node: EnhancedDOMTreeNode, depth: int = 0) -> SimplifiedNode | None:
-		"""Step 1: Create a simplified tree with enhanced element detection."""
+		"""
+		步骤一：复制“简化 DOM 树”，只保留对交互/文本有价值的节点。
+
+		逻辑包括：
+		* 递归展开 Document / Shadow DOM / IFrame，确保 SPA 内容不会丢失。
+		* 跳过 style/script/link 等禁用节点以及纯装饰的 SVG 子元素。
+		* 根据可见性、可滚动性、Shadow Host 等条件决定是否保留节点，
+		  并对隐藏但重要的控件（如被透明隐藏的 <input type=file>）做特殊处理。
+		"""
 
 		if node.node_type == NodeType.DOCUMENT_NODE:
 			# for all cldren including shadow roots
@@ -540,7 +591,12 @@ class DOMTreeSerializer:
 		return None
 
 	def _optimize_tree(self, node: SimplifiedNode | None) -> SimplifiedNode | None:
-		"""Step 2: Optimize tree structure."""
+		"""
+		步骤二：精简树结构。
+
+		在简化树基础上删除不可见且无子节点/滚动能力的包装元素，只保留：
+		可见节点、实际可滚动容器、文本节点、有子节点的容器以及强制保留的 file input。
+		"""
 		if not node:
 			return None
 
@@ -576,7 +632,12 @@ class DOMTreeSerializer:
 		return None
 
 	def _collect_interactive_elements(self, node: SimplifiedNode, elements: list[SimplifiedNode]) -> None:
-		"""Recursively collect interactive elements that are also visible."""
+		"""
+		递归收集“可交互且可见”的节点，供滚动容器逻辑判断。
+
+		这一步只在 `_has_interactive_descendants` 中使用，用于判断一个可滚动容器
+		是否已经包含其他交互点，避免重复编号。
+		"""
 		is_interactive = self._is_interactive_cached(node.original_node)
 		is_visible = node.original_node.snapshot_node and node.original_node.is_visible
 
@@ -588,7 +649,12 @@ class DOMTreeSerializer:
 			self._collect_interactive_elements(child, elements)
 
 	def _has_interactive_descendants(self, node: SimplifiedNode) -> bool:
-		"""Check if a node has any interactive descendants (not including the node itself)."""
+		"""
+		判断当前节点的子孙是否包含可交互元素（不含自身）。
+
+		滚动容器只有在内部完全没有交互点时才会自己获得一个 index，
+		该方法提供所需的布尔判断。
+		"""
 		# Check children for interactivity
 		for child in node.children:
 			# Check if child itself is interactive
@@ -601,7 +667,15 @@ class DOMTreeSerializer:
 		return False
 
 	def _assign_interactive_indices_and_mark_new_nodes(self, node: SimplifiedNode | None) -> None:
-		"""Assign interactive indices to clickable elements that are also visible."""
+		"""
+		为所有可交互节点分配索引，并记录 selector_map / 新节点状态。
+
+		逻辑：
+		* 跳过 paintOrder 或 bbox 已排除的节点。
+		* 判断是否是 scroll 容器、普通交互控件或隐藏的 file input，再决定是否赋值。
+		* 将 backend_node_id 存入 `_selector_map` 供 LLM 引用，并与上一帧对比决定
+		  `node.is_new`，从而在文本输出中加 `*`。
+		"""
 		if not node:
 			return
 
@@ -657,7 +731,12 @@ class DOMTreeSerializer:
 			self._assign_interactive_indices_and_mark_new_nodes(child)
 
 	def _apply_bounding_box_filtering(self, node: SimplifiedNode | None) -> SimplifiedNode | None:
-		"""Filter children contained within propagating parent bounds."""
+		"""
+		根据“包围盒传播”规则过滤被父节点完全覆盖的子节点。
+
+		例如一个大按钮包含纯文本子节点时，只保留父级即可，能减少 LLM 需要阅读的冗余。
+		该函数会递归标记 `excluded_by_parent` 并统计被排除的数量。
+		"""
 		if not node:
 			return None
 
@@ -675,8 +754,9 @@ class DOMTreeSerializer:
 
 	def _filter_tree_recursive(self, node: SimplifiedNode, active_bounds: PropagatingBounds | None = None, depth: int = 0):
 		"""
-		Recursively filter tree with bounding box propagation.
-		Bounds propagate to ALL descendants until overridden.
+		递归执行包围盒传播：只要父节点匹配 `PROPAGATING_ELEMENTS`，它的 bounds
+		就会一直向所有后代传递，直到遇到新的传播者为止。
+		过程中会标记哪些子节点因为完全被覆盖而可以省略。
 		"""
 
 		# Check if this node should be excluded by active bounds
@@ -712,7 +792,10 @@ class DOMTreeSerializer:
 
 	def _should_exclude_child(self, node: SimplifiedNode, active_bounds: PropagatingBounds) -> bool:
 		"""
-		Determine if child should be excluded based on propagating bounds.
+		判断某个子节点在当前传播 bounds 下是否应被折叠。
+
+		只有面积几乎完全被覆盖、且不属于“表单控件 / 具有 aria-label / 自身也是传播节点 /
+		带 onclick 或 ARIA role”的元素才会被排除，以避免隐藏真正的交互目标。
 		"""
 
 		# Never exclude text nodes - we always want to preserve text content
@@ -769,10 +852,9 @@ class DOMTreeSerializer:
 
 	def _is_contained(self, child: DOMRect, parent: DOMRect, threshold: float) -> bool:
 		"""
-		Check if child is contained within parent bounds.
+		计算子元素的面积有多少比例落在父元素 bounds 内。
 
-		Args:
-			threshold: Percentage (0.0-1.0) of child that must be within parent
+		`threshold` 取值 0-1，表示要满足多少覆盖率才算“被包含”，最终用于 bbox 过滤。
 		"""
 		# Calculate intersection
 		x_overlap = max(0, min(child.x + child.width, parent.x + parent.width) - max(child.x, parent.x))
@@ -788,7 +870,7 @@ class DOMTreeSerializer:
 		return containment_ratio >= threshold
 
 	def _count_excluded_nodes(self, node: SimplifiedNode, count: int = 0) -> int:
-		"""Count how many nodes were excluded (for debugging)."""
+		"""统计被 bbox 过滤排除的节点数量，方便日志调试。"""
 		if hasattr(node, 'excluded_by_parent') and node.excluded_by_parent:
 			count += 1
 		for child in node.children:
@@ -797,8 +879,10 @@ class DOMTreeSerializer:
 
 	def _is_propagating_element(self, attributes: dict[str, str | None]) -> bool:
 		"""
-		Check if an element should propagate bounds based on attributes.
-		If the element satisfies one of the patterns, it propagates bounds to all its children.
+		根据 tag/role 判断一个元素是否属于“包围盒传播者”。
+
+		匹配 `PROPAGATING_ELEMENTS` 的元素（如 <a>、role=button 的 div）会把自己的 bounds
+		传递给所有子孙，用于折叠重复内容。
 		"""
 		keys_to_check = ['tag', 'role']
 		for pattern in self.PROPAGATING_ELEMENTS:
@@ -811,7 +895,12 @@ class DOMTreeSerializer:
 
 	@staticmethod
 	def serialize_tree(node: SimplifiedNode | None, include_attributes: list[str], depth: int = 0) -> str:
-		"""Serialize the optimized tree to string format."""
+		"""
+		将优化后的树转换成 LLM 可读的字符串。
+
+		它会按缩进输出节点层级，在行首加上 |SHADOW| / |SCROLL| / [backend_node_id] 等
+		标记，必要时折叠 SVG、Shadow DOM、文本节点，并附带 compound_components 信息。
+		"""
 		if not node:
 			return ''
 
@@ -999,7 +1088,16 @@ class DOMTreeSerializer:
 
 	@staticmethod
 	def _build_attributes_string(node: EnhancedDOMTreeNode, include_attributes: list[str], text: str) -> str:
-		"""Build the attributes string for an element."""
+		"""
+		根据 `include_attributes` 和节点信息拼装属性字符串。
+
+		它会：
+		* 过滤出允许的 HTML 属性，并针对日期/时间类 input 自动注入 format 提示；
+		* 从 AX 树补齐 valuetext/value；
+		* 去除重复或无意义的属性（如 role 与 tag 相同、placeholder 与文本相同等）；
+		* 对过长的值使用 `cap_text_length` 裁剪。
+		最终输出形如 `placeholder=Search value=foo` 的片段。
+		"""
 		attributes_to_include = {}
 
 		# Include HTML attributes
