@@ -143,6 +143,9 @@ class CurrentPageTargets:
 
 @dataclass
 class TargetAllTrees:
+	'''
+	dom原始抓取返回数据
+	'''
 	snapshot: CaptureSnapshotReturns
 	dom_tree: GetDocumentReturns
 	ax_tree: GetFullAXTreeReturns

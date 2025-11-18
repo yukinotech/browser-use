@@ -246,6 +246,13 @@ class DomService:
 		return {'nodes': merged_nodes}
 
 	async def _get_all_trees(self, target_id: TargetID) -> TargetAllTrees:
+		"""
+		按以下步骤并发抓取当前 target 的 DOM/AX/Snapshot 相关数据：
+			1. 通过 CDP session 等待页面 readyState，并在采集前记录 iframe 的真实滚动位置，便于后续坐标修正。
+			2. 并行发起 DOMSnapshot、DOM.getDocument、Accessibility.getFullAXTree（包含所有 iframe）以及视口像素比查询，若 10s 内未完成则自动取消、重试，最终保证所有必要数据成功返回。
+			3. 收集结果后统计耗时；若 snapshot 中 iframe 过多会截断到 `self.max_iframes` 并输出调试日志（含各 iframe 的节点数）。
+			4. 返回 `TargetAllTrees`，携带 snapshot/DOM/AX/像素比以及详细的时间分布，为 `get_dom_tree` 等后续构建提供原始输入和性能指标。
+		"""
 		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
 
 		# Wait for the page to be ready first
